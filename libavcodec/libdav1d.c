@@ -425,8 +425,24 @@ FF_ENABLE_DEPRECATION_WARNINGS
             av_log(c, AV_LOG_WARNING, "Error parsing DOVI OBU.\n");
             return 0; // ignore
         }
-
         res = ff_dovi_attach_side_data(&dav1d->dovi, frame);
+        if (res < 0)
+            return res;
+    } else if (country_code == ITU_T_T35_COUNTRY_CODE_US &&
+               provider_code == ITU_T_T35_PROVIDER_CODE_SMPTE) {
+        AVDynamicHDRSmpte2094App5 *hdr_smpte2094_app5;
+        int provider_oriented_code = bytestream2_get_be16(&gb);
+        if (provider_oriented_code != 1)
+            return 0; // ignore
+
+        hdr_smpte2094_app5 =
+            av_dynamic_hdr_smpte2094_app5_create_side_data(frame);
+        if (!hdr_smpte2094_app5)
+            return AVERROR(ENOMEM);
+
+        res = av_dynamic_hdr_smpte2094_app5_from_t35(
+            hdr_smpte2094_app5, gb.buffer,
+            bytestream2_get_bytes_left(&gb));
         if (res < 0)
             return res;
     } else {
