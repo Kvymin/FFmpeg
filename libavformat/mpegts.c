@@ -114,6 +114,11 @@ struct Stream {
     int stream_identifier;
 };
 
+struct DOVIStreamDependency {
+    AVStream *el;
+    int dependency_pid;
+};
+
 #define MAX_STREAMS_PER_PROGRAM 128
 #define MAX_PIDS_PER_PROGRAM (MAX_STREAMS_PER_PROGRAM + 2)
 struct Program {
@@ -122,6 +127,8 @@ struct Program {
     unsigned int pids[MAX_PIDS_PER_PROGRAM];
     unsigned int nb_streams;
     struct Stream streams[MAX_STREAMS_PER_PROGRAM];
+    unsigned int nb_dovi_dependencies;
+    struct DOVIStreamDependency dovi_dependencies[MAX_STREAMS_PER_PROGRAM];
 
     /** have we found pmt for this program */
     int pmt_found;
@@ -312,6 +319,7 @@ static void clear_program(struct Program *p)
         return;
     p->nb_pids = 0;
     p->nb_streams = 0;
+    p->nb_dovi_dependencies = 0;
     p->pmt_found = 0;
 }
 
@@ -2446,6 +2454,27 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
                    dependency_pid,
                    dovi->dv_bl_signal_compatibility_id,
                    dovi->dv_md_compression);
+
+            if (ts && dovi->dv_profile == 7 && dovi->el_present_flag &&
+                !dovi->bl_present_flag && dependency_pid >= 0) {
+                struct Program *p = get_program(ts, prg_id);
+                if (p) {
+                    unsigned i;
+                    for (i = 0; i < p->nb_dovi_dependencies; i++) {
+                        if (p->dovi_dependencies[i].el == st)
+                            break;
+                    }
+                    if (i == p->nb_dovi_dependencies) {
+                        if (i >= MAX_STREAMS_PER_PROGRAM)
+                            return AVERROR(EINVAL);
+                        p->nb_dovi_dependencies++;
+                    }
+                    p->dovi_dependencies[i] = (struct DOVIStreamDependency) {
+                        .el = st,
+                        .dependency_pid = dependency_pid,
+                    };
+                }
+            }
         }
         break;
     case EXTENSION_DESCRIPTOR: /* descriptor extension */
@@ -2538,6 +2567,81 @@ static int is_pes_stream(int stream_type, uint32_t prog_reg_desc)
         return !(prog_reg_desc == AV_RL32("CUEI"));
     default:
         return 1;
+    }
+}
+
+static AVStream *program_stream_by_pid(MpegTSContext *ts,
+                                       const struct Program *prg, int pid)
+{
+    for (int i = 0; i < prg->nb_streams; i++) {
+        int idx = prg->streams[i].idx;
+        if (idx < 0 || idx >= ts->stream->nb_streams)
+            continue;
+        AVStream *st = ts->stream->streams[idx];
+        if (st->id == pid)
+            return st;
+    }
+    return NULL;
+}
+
+static void create_dovi_stream_group(MpegTSContext *ts, AVStream *bl,
+                                     AVStream *el)
+{
+    AVFormatContext *fc = ts->stream;
+    AVStreamGroup *stg;
+    int ret;
+
+    for (int i = 0; i < fc->nb_stream_groups; i++) {
+        stg = fc->stream_groups[i];
+        if (stg->type != AV_STREAM_GROUP_PARAMS_DOLBY_VISION)
+            continue;
+        for (int j = 0; j < stg->nb_streams; j++) {
+            if (stg->streams[j] == el)
+                return;
+        }
+    }
+
+    stg = avformat_stream_group_create(
+        fc, AV_STREAM_GROUP_PARAMS_DOLBY_VISION, NULL);
+    if (!stg)
+        return;
+    stg->id = el->id;
+
+    ret = avformat_stream_group_add_stream(stg, bl);
+    if (ret < 0)
+        goto fail;
+    ret = avformat_stream_group_add_stream(stg, el);
+    if (ret < 0)
+        goto fail;
+
+    stg->params.layered_video->el_index = stg->nb_streams - 1;
+    stg->params.layered_video->width = bl->codecpar->width;
+    stg->params.layered_video->height = bl->codecpar->height;
+    return;
+
+fail:
+    ff_remove_stream_group(fc, stg);
+}
+
+static void create_dovi_stream_groups(MpegTSContext *ts,
+                                      const struct Program *prg,
+                                      uint32_t prog_reg_desc)
+{
+    for (int i = 0; i < prg->nb_dovi_dependencies; i++) {
+        const struct DOVIStreamDependency *dep = &prg->dovi_dependencies[i];
+        AVStream *bl = program_stream_by_pid(ts, prg, dep->dependency_pid);
+        if (bl)
+            create_dovi_stream_group(ts, bl, dep->el);
+    }
+
+    /* UHD Blu-ray signals its Profile 7 enhancement layer as an ordinary
+     * HEVC stream on the fixed 0x1015 PID, without a DOVI descriptor. */
+    if (prog_reg_desc == AV_RL32("HDMV")) {
+        AVStream *bl = program_stream_by_pid(ts, prg, M2TS_VIDEO_PID);
+        AVStream *el = program_stream_by_pid(ts, prg, M2TS_VIDEO_EL_PID);
+        if (bl && el && bl->codecpar->codec_id == AV_CODEC_ID_HEVC &&
+            el->codecpar->codec_id == AV_CODEC_ID_HEVC)
+            create_dovi_stream_group(ts, bl, el);
     }
 }
 
@@ -2758,6 +2862,9 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
         mpegts_open_pcr_filter(ts, pcr_pid);
 
 out:
+    if (prg)
+        create_dovi_stream_groups(ts, prg, prog_reg_desc);
+
     for (i = 0; i < mp4_descr_count; i++)
         av_free(mp4_descr[i].dec_config_descr);
 }
