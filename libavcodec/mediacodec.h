@@ -86,6 +86,17 @@ int av_mediacodec_get_buffer_timestamp(const AVMediaCodecBuffer *buffer,
                                        int64_t *presentation_time_us);
 
 /**
+ * Release a MediaCodec output buffer and report whether it was submitted to
+ * the codec. Buffers invalidated by a decoder flush are consumed without being
+ * submitted because their output generation no longer exists.
+ *
+ * @param buffer the MediaCodec output buffer
+ * @param render 1 to render the buffer to the surface or 0 to discard it
+ * @return 1 if submitted, 0 if already released or invalidated, < 0 on error
+ */
+int av_mediacodec_release_buffer_status(AVMediaCodecBuffer *buffer, int render);
+
+/**
  * Release a MediaCodec buffer and render it to the surface that is associated
  * with the decoder. This function should only be called once on a given
  * buffer, once released the underlying buffer returns to the codec, thus
