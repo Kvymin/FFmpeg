@@ -3352,11 +3352,8 @@ static int matroska_parse_dovi_streams(AVFormatContext *s)
     AVStreamGroup *stg;
     int err;
 
-    /* Matroska has no explicit cross-track Dolby Vision reference, so the
-     * pairing is recovered from the dvcC/dvvC config records. Find a single
-     * HEVC track whose record declares a profile 7 enhancement layer
-     * (el_present_flag=1) and a single sibling HEVC BL candidate. If either
-     * side is ambiguous, leave the streams ungrouped. */
+    /* Matroska has no explicit cross-track Dolby Vision reference. Pair one
+     * Profile 7 EL track with one unambiguous HEVC base-layer candidate. */
     if (s->nb_streams <= 1)
         return 0;
 
@@ -3374,11 +3371,13 @@ static int matroska_parse_dovi_streams(AVFormatContext *s)
         if (sd) {
             dovi = (const AVDOVIDecoderConfigurationRecord *)sd->data;
             if (dovi->dv_profile == 7 && dovi->el_present_flag) {
-                /* bl_present_flag is not checked, because the files in the
-                 * wild set it to 1 for EL stream, while the expectation, based
-                 * on Dolby spec for MPEG-TS would be that it's set to 0.
-                 * Ignore this, if we have EL track and single other video track
-                 * it's safe to assume it's BL. */
+                const AVPacketSideData *hvce =
+                    av_packet_side_data_get(st->codecpar->coded_side_data,
+                                            st->codecpar->nb_coded_side_data,
+                                            AV_PKT_DATA_HEVC_CONF);
+                // hvcE marks an interleaved BL+EL track, not a separate EL.
+                if (hvce)
+                    continue;
                 if (el_st)
                     return 0;
                 el_st = st;
@@ -3394,16 +3393,15 @@ static int matroska_parse_dovi_streams(AVFormatContext *s)
     if (!el_st || !bl_st)
         return 0;
 
-    stg = avformat_stream_group_create(s, AV_STREAM_GROUP_PARAMS_DOLBY_VISION, NULL);
+    stg = avformat_stream_group_create(
+        s, AV_STREAM_GROUP_PARAMS_DOLBY_VISION, NULL);
     if (!stg)
         return AVERROR(ENOMEM);
-
     stg->id = el_st->id;
 
     err = avformat_stream_group_add_stream(stg, bl_st);
     if (err < 0)
         return err;
-
     err = avformat_stream_group_add_stream(stg, el_st);
     if (err < 0)
         return err;
