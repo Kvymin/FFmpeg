@@ -39,6 +39,7 @@ static struct {
     StoredSegment *segments;
     int count;
     int status;
+    int first_unread_index;
 } plan;
 
 static void clear_plan(void)
@@ -49,6 +50,7 @@ static void clear_plan(void)
     av_freep(&plan.session);
     plan.count = 0;
     plan.status = AV_HLS_AD_PLAN_UNKNOWN;
+    plan.first_unread_index = -1;
 }
 
 int avformat_hls_ad_plan_publish(const char *session,
@@ -102,6 +104,7 @@ int avformat_hls_ad_plan_publish(const char *session,
     plan.segments = copy;
     plan.count = count;
     plan.status = AV_HLS_AD_PLAN_PENDING;
+    plan.first_unread_index = -1;
     ff_mutex_unlock(&plan_mutex);
     return 0;
 
@@ -127,6 +130,17 @@ int avformat_hls_ad_plan_status(const char *session)
                  ? plan.status : AV_HLS_AD_PLAN_UNKNOWN;
     ff_mutex_unlock(&plan_mutex);
     return status;
+}
+
+int avformat_hls_ad_plan_first_unread_index(const char *session)
+{
+    int first_unread_index;
+    ff_mutex_lock(&plan_mutex);
+    first_unread_index = session && plan.session && !strcmp(session, plan.session) &&
+                         plan.status == AV_HLS_AD_PLAN_APPLIED
+                             ? plan.first_unread_index : -1;
+    ff_mutex_unlock(&plan_mutex);
+    return first_unread_index;
 }
 
 void avformat_hls_ad_plan_clear(const char *session)
@@ -183,8 +197,11 @@ int ff_hls_ad_plan_apply(const char *session, const AVHLSAdSegment *actual,
         }
         while (end < count && plan.segments[end].remove)
             end++;
-        if (first < first_unread_index)
-            goto reject;
+        /* A range already being read cannot be removed, but later ranges can. */
+        if (first < first_unread_index) {
+            first = end;
+            continue;
+        }
         for (int i = first; i < end; i++) {
             if (duration > INT64_MAX - actual[i].duration_us)
                 goto reject;
@@ -200,10 +217,14 @@ int ff_hls_ad_plan_apply(const char *session, const AVHLSAdSegment *actual,
         }
         while (end < count && plan.segments[end].remove)
             end++;
-        memset(remove + first, 1, end - first);
+        if (first >= first_unread_index)
+            memset(remove + first, 1, end - first);
         first = end;
     }
+    if (!duration)
+        goto reject;
     *removed_duration_us = duration;
+    plan.first_unread_index = first_unread_index;
     plan.status = AV_HLS_AD_PLAN_APPLIED;
     goto finish;
 

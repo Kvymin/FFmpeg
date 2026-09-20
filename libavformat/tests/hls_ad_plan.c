@@ -42,7 +42,9 @@ static int test_future_segment(void)
               "only the ad is removed") ||
         check(duration == 2000000, "removed duration") ||
         check(avformat_hls_ad_plan_status("future") == AV_HLS_AD_PLAN_APPLIED,
-              "applied status"))
+              "applied status") ||
+        check(avformat_hls_ad_plan_first_unread_index("future") == 1,
+              "applied frontier"))
         return 1;
     avformat_hls_ad_plan_clear("future");
     return 0;
@@ -58,6 +60,8 @@ static int test_already_read_segment(void)
               "consume read plan") ||
         check(avformat_hls_ad_plan_status("read") == AV_HLS_AD_PLAN_REJECTED,
               "read ad rejected") ||
+        check(avformat_hls_ad_plan_first_unread_index("read") == -1,
+              "rejected frontier unavailable") ||
         check(!remove[0] && !remove[1] && !remove[2] && !duration,
               "read ad has no effect"))
         return 1;
@@ -131,7 +135,9 @@ static int test_changed_duration(void)
 static int test_mixed_past_and_future_ads(void)
 {
     const AVHLSAdSegment two_ads[] = {
-        segments[0], segments[1], segments[2],
+        { "https://example.test/opening1.ts", 2000000, 0, -1, 1 },
+        { "https://example.test/opening2.ts", 2000000, 0, -1, 1 },
+        segments[2],
         { "https://example.test/ad2.ts", 2000000, 0, -1, 1 },
         { "https://example.test/end.ts", 5000000, 0, -1, 0 },
     };
@@ -140,13 +146,15 @@ static int test_mixed_past_and_future_ads(void)
 
     if (check(!avformat_hls_ad_plan_publish("mixed", two_ads, 5),
               "publish two ads") ||
-        check(ff_hls_ad_plan_apply("mixed", two_ads, 5, 2,
+        check(ff_hls_ad_plan_apply("mixed", two_ads, 5, 1,
                                     remove, &duration) == 1,
               "consume mixed plan") ||
-        check(avformat_hls_ad_plan_status("mixed") == AV_HLS_AD_PLAN_REJECTED,
-              "past ad rejects whole plan") ||
-        check(!remove[1] && !remove[3] && !duration,
-              "mixed plan has no partial effect"))
+        check(avformat_hls_ad_plan_status("mixed") == AV_HLS_AD_PLAN_APPLIED,
+              "future ad remains applicable") ||
+        check(avformat_hls_ad_plan_first_unread_index("mixed") == 1,
+              "partial plan frontier") ||
+        check(!remove[0] && !remove[1] && remove[3] && duration == 2000000,
+              "only the complete future ad is removed"))
         return 1;
     avformat_hls_ad_plan_clear("mixed");
     return 0;

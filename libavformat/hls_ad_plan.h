@@ -40,6 +40,8 @@ enum AVHLSAdPlanStatus {
 int avformat_hls_ad_plan_publish(const char *session,
                                  const AVHLSAdSegment *segments, int count);
 int avformat_hls_ad_plan_status(const char *session);
+/* Returns the loading frontier of an applied plan, or -1 if unavailable. */
+int avformat_hls_ad_plan_first_unread_index(const char *session);
 void avformat_hls_ad_plan_clear(const char *session);
 
 #ifdef __cplusplus
