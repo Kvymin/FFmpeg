@@ -47,6 +47,7 @@
 #include "url.h"
 
 #include "hls_sample_encryption.h"
+#include "hls_ad_plan_internal.h"
 #include "hls_timestamp.h"
 
 #define INITIAL_BUFFER_SIZE 32768
@@ -77,6 +78,7 @@ enum KeyType {
 
 struct segment {
     int64_t duration;
+    int ad_removed;
     int64_t url_offset;
     int64_t size;
     char *url;
@@ -250,6 +252,7 @@ typedef struct HLSContext {
     int http_seekable;
     int seg_max_retry;
     AVIOContext *playlist_pb;
+    char *media3_ad_session;
     HLSCryptoContext  crypto_ctx;
 } HLSContext;
 
@@ -1226,6 +1229,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                     duration = 0.001 * AV_TIME_BASE;
                 }
                 seg->duration = duration;
+                seg->ad_removed = 0;
                 seg->key_type = key_type;
                 pls->has_discontinuity |= discontinuity;
                 dynarray_add(&pls->segments, &pls->n_segments, seg);
@@ -1300,9 +1304,78 @@ static struct segment *current_segment(struct playlist *pls)
 static struct segment *next_segment(struct playlist *pls)
 {
     int64_t n = pls->cur_seq_no - pls->start_seq_no + 1;
+    while (n < pls->n_segments && pls->segments[n]->ad_removed)
+        n++;
     if (n >= pls->n_segments)
         return NULL;
     return pls->segments[n];
+}
+
+static void maybe_apply_ad_plan(HLSContext *c)
+{
+    struct playlist *pls;
+    AVHLSAdSegment *actual;
+    uint8_t *remove;
+    int64_t removed_duration = 0;
+    int64_t frontier;
+    int result;
+
+    if (!c->media3_ad_session ||
+        avformat_hls_ad_plan_status(c->media3_ad_session) != AV_HLS_AD_PLAN_PENDING)
+        return;
+    if (c->n_playlists != 1 || c->n_variants != 1 || c->n_renditions != 0) {
+        ff_hls_ad_plan_reject(c->media3_ad_session);
+        return;
+    }
+    pls = c->playlists[0];
+    if (!pls->finished || pls->time_offset_flag || !pls->n_segments ||
+        c->ctx->duration == AV_NOPTS_VALUE) {
+        ff_hls_ad_plan_reject(c->media3_ad_session);
+        return;
+    }
+    if (c->first_timestamp == AV_NOPTS_VALUE)
+        return;
+    actual = av_calloc(pls->n_segments, sizeof(*actual));
+    remove = av_calloc(pls->n_segments, sizeof(*remove));
+    if (!actual || !remove) {
+        ff_hls_ad_plan_reject(c->media3_ad_session);
+        goto cleanup;
+    }
+    for (int i = 0; i < pls->n_segments; i++) {
+        const struct segment *seg = pls->segments[i];
+        actual[i] = (AVHLSAdSegment) {
+            .url = seg->url,
+            .duration_us = seg->duration,
+            .byte_range_offset = seg->url_offset,
+            .byte_range_length = seg->size,
+        };
+    }
+    /* The current segment may already have bytes buffered in its subdemuxer. */
+    frontier = pls->cur_seq_no - pls->start_seq_no + 1;
+    frontier = FFMIN(pls->n_segments, FFMAX(0, frontier));
+    result = ff_hls_ad_plan_apply(c->media3_ad_session, actual,
+                                  pls->n_segments, frontier, remove,
+                                  &removed_duration);
+    if (result <= 0 || !removed_duration)
+        goto cleanup;
+    if (pls->input_next_requested) {
+        /* A prefetched next segment has not been read. Discard its connection
+         * before skipping it, or the next read could use the ad bytes. */
+        int64_t next = pls->cur_seq_no - pls->start_seq_no + 1;
+        if (next >= 0 && next < pls->n_segments && remove[next]) {
+            ff_format_io_close(pls->parent, &pls->input_next);
+            pls->input_next_requested = 0;
+        }
+    }
+    for (int i = 0; i < pls->n_segments; i++)
+        pls->segments[i]->ad_removed = remove[i];
+    pls->has_discontinuity = 1;
+    c->ctx->duration -= removed_duration;
+    av_log(c->ctx, AV_LOG_INFO, "Removed verified future HLS ad segments\n");
+
+cleanup:
+    av_free(remove);
+    av_free(actual);
 }
 
 /* True if 'next' can be reached by seeking the open 'in' instead of reopening.
@@ -1605,7 +1678,8 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
             int64_t n = pls->cur_seq_no - pls->start_seq_no + 1;
             while (n < pls->n_segments) {
                 struct segment *ns = pls->segments[n];
-                if (ns->size < 0 || ns->url_offset != end_offset ||
+                if (ns->ad_removed || ns->size < 0 ||
+                    ns->url_offset != end_offset ||
                     ns->key_type != KEY_NONE ||
                     ns->init_section != seg->init_section ||
                     strcmp(ns->url, seg->url))
@@ -1790,6 +1864,8 @@ static int reload_playlist(struct playlist *v, HLSContext *c)
     int ret = 0;
     int reload_count = 0;
 
+    maybe_apply_ad_plan(c);
+
     v->needed = playlist_needed(v);
 
     if (!v->needed)
@@ -1834,6 +1910,24 @@ reload:
                    "skipping %"PRId64" segments ahead, expired from playlists\n",
                    v->start_seq_no - v->cur_seq_no);
             v->cur_seq_no = v->start_seq_no;
+        }
+
+        if (v->finished) {
+            int64_t index = v->cur_seq_no - v->start_seq_no;
+            int skipped = 0;
+            while (index >= 0 && index < v->n_segments &&
+                   v->segments[index]->ad_removed) {
+                v->cur_seq_no++;
+                index++;
+                skipped = 1;
+            }
+            if (skipped && index < v->n_segments) {
+                int64_t start = c->first_timestamp;
+                for (int i = 0; i < index; i++)
+                    if (!v->segments[i]->ad_removed)
+                        start = av_sat_add64(start, v->segments[i]->duration);
+                reset_playlist_timestamps(v, start);
+            }
         }
         if (v->cur_seq_no > v->last_seq_no) {
             v->last_seq_no = v->cur_seq_no;
@@ -1965,7 +2059,10 @@ restart:
 
         return ret;
     }
-    if (ret == 0 && segment_reusable(v->input, seg, next_segment(v))) {
+    int64_t next_index = v->cur_seq_no - v->start_seq_no + 1;
+    if (ret == 0 && next_index < v->n_segments &&
+        !v->segments[next_index]->ad_removed &&
+        segment_reusable(v->input, seg, next_segment(v))) {
         /* Clean boundary, and the next segment continues this resource. Keep
          * the connection open and read it as a whole. Note that splitting
          * segments in these cases is useful for dynamic variant/quality
@@ -2163,7 +2260,8 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
     }
 
     for (i = 0; i < pls->n_segments; i++) {
-        int64_t diff = pos + pls->segments[i]->duration - timestamp;
+        int64_t duration = pls->segments[i]->ad_removed ? 0 : pls->segments[i]->duration;
+        int64_t diff = pos + duration - timestamp;
         if (diff > 0) {
             *seq_no = pls->start_seq_no + i;
             if (seg_start_ts) {
@@ -2171,7 +2269,7 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
             }
             return 1;
         }
-        pos += pls->segments[i]->duration;
+        pos += duration;
     }
 
     *seq_no = pls->start_seq_no + pls->n_segments - 1;
@@ -3317,6 +3415,8 @@ static const AVOption hls_options[] = {
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
     {"seg_max_retry", "Maximum number of times to reload a segment on error.",
      OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
+    {"media3_ad_session", "Android HLS ad removal session",
+     OFFSET(media3_ad_session), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS},
     {NULL}
 };
 

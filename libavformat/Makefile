@@ -3,6 +3,7 @@ DESC = FFmpeg container format library
 
 HEADERS = avformat.h                                                    \
           avio.h                                                        \
+          hls_ad_plan.h                                                 \
           version.h                                                     \
           version_major.h                                               \
 
@@ -274,7 +275,7 @@ OBJS-$(CONFIG_HEVC_DEMUXER)              += hevcdec.o rawdec.o
 OBJS-$(CONFIG_HEVC_MUXER)                += rawenc.o
 OBJS-$(CONFIG_EVC_DEMUXER)               += evcdec.o rawdec.o
 OBJS-$(CONFIG_EVC_MUXER)                 += rawenc.o
-OBJS-$(CONFIG_HLS_DEMUXER)               += hls.o hls_sample_encryption.o hls_timestamp.o
+OBJS-$(CONFIG_HLS_DEMUXER)               += hls.o hls_ad_plan.o hls_sample_encryption.o hls_timestamp.o
 OBJS-$(CONFIG_HLS_MUXER)                 += hlsenc.o hlsplaylist.o
 OBJS-$(CONFIG_HNM_DEMUXER)               += hnm.o
 OBJS-$(CONFIG_HXVS_DEMUXER)              += hxvs.o
@@ -790,7 +791,7 @@ FIFO-MUXER-TESTPROGS-$(CONFIG_NETWORK)   += fifo_muxer
 TESTPROGS-$(CONFIG_FIFO_MUXER)           += $(FIFO-MUXER-TESTPROGS-yes)
 TESTPROGS-$(CONFIG_DASH_DEMUXER)         += dash
 TESTPROGS-$(CONFIG_FFRTMPCRYPT_PROTOCOL) += rtmpdh
-TESTPROGS-$(CONFIG_HLS_DEMUXER)          += hls_timestamp
+TESTPROGS-$(CONFIG_HLS_DEMUXER)          += hls_ad_plan hls_timestamp
 TESTPROGS-$(CONFIG_MOV_MUXER)            += movenc
 TESTPROGS-$(CONFIG_NETWORK)              += noproxy
 TESTPROGS-$(CONFIG_SRTP)                 += srtp
