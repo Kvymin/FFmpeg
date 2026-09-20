@@ -269,9 +269,11 @@ static int libarcdav3a_decode_buffer(AVCodecContext *avctx, const uint8_t *input
             return AVERROR_INVALIDDATA;
 
         if (s->decoder->numObjsOutput > AV3A_MAX_OBJECTS) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "AV3A object count %d exceeds the supported maximum of %d\n",
+                   s->decoder->numObjsOutput, AV3A_MAX_OBJECTS);
             libarcdav3a_flush(avctx);
-            out_index = 0;
-            break;
+            return AVERROR(ENOSYS);
         }
 
         if ((s->last_channel_config != -1 &&

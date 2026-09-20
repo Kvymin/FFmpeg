@@ -38,6 +38,14 @@ void avs3_destroy_decoder(AVS3DecoderHandle hAvs3Dec)
     LOGD("avs3_destroy_decoder out\n");
 }
 
+static int valid_bitrate(uint16_t channel_config, uint16_t bitrate_index)
+{
+    return channel_config < CHANNEL_CONFIG_UNKNOWN &&
+           bitrate_index < AVS3_SIZE_BITRATE_TABLE &&
+           codecBitrateConfigTable[channel_config].bitrateTable &&
+           codecBitrateConfigTable[channel_config].bitrateTable[bitrate_index] > 0;
+}
+
 /*
 	return value:
 		0: failed
@@ -117,6 +125,8 @@ int parse_header(AVS3DecoderHandle hAvs3Dec, unsigned char* pData, int nLenIn, i
     // sampling rate index, 4 bit
     uint16_t samplingRateIdx;
     samplingRateIdx = (uint16_t)GetNextIndice(headerBs, &nextBitPos, NBITS_SAMPLING_RATE_INDEX);
+    if (samplingRateIdx >= AVS3_SIZE_FS_TABLE)
+        return AVS3_FALSE;
 
     // CRC first part
     uint16_t crcTmp;
@@ -175,6 +185,14 @@ int parse_header(AVS3DecoderHandle hAvs3Dec, unsigned char* pData, int nLenIn, i
     if (codingProfile != 1) {
         bitrateIdx = (uint16_t)GetNextIndice(headerBs, &nextBitPos, NBITS_BITRATE_INDEX);
     }
+
+    if (nnTypeConfig > NN_TYPE_DEFAULT_LC || resolution > 2 || codingProfile > 2 ||
+        (codingProfile == 1 &&
+         (soundBedType > 1 || numObjs > MAX_CHANNELS ||
+          !valid_bitrate(CHANNEL_CONFIG_MONO, bitrateIdxPerObj) ||
+          (soundBedType == 1 && !valid_bitrate(channelNumIdx, bitrateIdxBedMc)))) ||
+        (codingProfile == 2 && hoaOrder > 3))
+        return AVS3_FALSE;
 
     // second part of CRC, 8 bits
     crcTmp += (uint16_t)GetNextIndice(headerBs, &nextBitPos, AVS3_BS_BYTE_SIZE);
@@ -354,7 +372,8 @@ int parse_header(AVS3DecoderHandle hAvs3Dec, unsigned char* pData, int nLenIn, i
         hAvs3Dec->isMixedContent = 0;
     }
 
-    if (hAvs3Dec->channelNumConfig >= CHANNEL_CONFIG_UNKNOWN || hAvs3Dec->channelNumConfig < CHANNEL_CONFIG_MONO)
+    if (hAvs3Dec->numChansOutput <= 0 || hAvs3Dec->numChansOutput > MAX_CHANNELS ||
+        hAvs3Dec->channelNumConfig >= CHANNEL_CONFIG_UNKNOWN || hAvs3Dec->channelNumConfig < CHANNEL_CONFIG_MONO)
     {
         LOGD("%p, channelNumConfig(%d) invalid.", hAvs3Dec, hAvs3Dec->channelNumConfig);
         return AVS3_FALSE;
@@ -362,6 +381,8 @@ int parse_header(AVS3DecoderHandle hAvs3Dec, unsigned char* pData, int nLenIn, i
 
     // total bitrate
     if (hAvs3Dec->isMixedContent == 0) {
+        if (!valid_bitrate(hAvs3Dec->channelNumConfig, bitrateIdx))
+            return AVS3_FALSE;
         hAvs3Dec->totalBitrate = codecBitrateConfigTable[hAvs3Dec->channelNumConfig].bitrateTable[bitrateIdx];
     }
 
