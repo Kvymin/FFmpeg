@@ -15,6 +15,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct AVHLSAdSegment {
     const char *url;
     int64_t duration_us;
@@ -37,5 +41,9 @@ int avformat_hls_ad_plan_publish(const char *session,
                                  const AVHLSAdSegment *segments, int count);
 int avformat_hls_ad_plan_status(const char *session);
 void avformat_hls_ad_plan_clear(const char *session);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
