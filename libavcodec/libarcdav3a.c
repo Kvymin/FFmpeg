@@ -246,6 +246,13 @@ static int libarcdav3a_decode_buffer(AVCodecContext *avctx, const uint8_t *input
             if (consumed < 0)
                 return AVERROR_INVALIDDATA;
 
+            if (ret == AVS3_UNSUPPORTED) {
+                av_log(avctx, AV_LOG_ERROR,
+                       "AV3A pure-object audio requires speaker rendering\n");
+                libarcdav3a_flush(avctx);
+                return AVERROR(ENOSYS);
+            }
+
             if (ret == AVS3_DATA_NOT_ENOUGH) {
                 if (pos + consumed < s->buffered_size)
                     pos += consumed;
@@ -267,6 +274,13 @@ static int libarcdav3a_decode_buffer(AVCodecContext *avctx, const uint8_t *input
             break;
         if (consumed < 0)
             return AVERROR_INVALIDDATA;
+
+        if (s->decoder->avs3CodecFormat == AVS3_HOA_FORMAT) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "AV3A HOA audio requires speaker rendering\n");
+            libarcdav3a_flush(avctx);
+            return AVERROR(ENOSYS);
+        }
 
         if (s->decoder->numObjsOutput > AV3A_MAX_OBJECTS) {
             av_log(avctx, AV_LOG_ERROR,

@@ -59,6 +59,23 @@ static void assert_header(unsigned profile, unsigned sampling_rate,
     assert_parsed_header(header, expected);
 }
 
+static void make_pure_object_header(uint8_t *header)
+{
+    int position = 0;
+    memset(header, 0, MAX_NBYTES_FRAME_HEADER);
+    put_bits(header, &position, SYNC_WORD_COMPAT, 12);
+    put_bits(header, &position, 2, 4);
+    put_bits(header, &position, 0, 1 + 3);
+    put_bits(header, &position, 1, 3); /* Mixed-content profile. */
+    put_bits(header, &position, 2, 4); /* 48 kHz. */
+    put_bits(header, &position, 0, 8);
+    put_bits(header, &position, 0, 2); /* No sound bed. */
+    put_bits(header, &position, 0, 7); /* One object. */
+    put_bits(header, &position, 0, 4); /* Per-object bitrate. */
+    put_bits(header, &position, 1, 2); /* 16-bit resolution. */
+    put_bits(header, &position, 0, 8);
+}
+
 int main(void)
 {
     uint8_t header[MAX_NBYTES_FRAME_HEADER];
@@ -70,6 +87,8 @@ int main(void)
     assert_header(1, 2, CHANNEL_CONFIG_MC_7_1_4, 5, 0, AVS3_FALSE);
     assert_header(1, 2, CHANNEL_CONFIG_MC_5_1, 17, 0, AVS3_FALSE);
     assert_header(1, 2, 127, 1, 0, AVS3_FALSE);
+    make_pure_object_header(header);
+    assert_parsed_header(header, AVS3_UNSUPPORTED);
     make_header(header, 0, 2, CHANNEL_CONFIG_MONO, 0, 0);
     header[2] |= 0x20; /* Unsupported neural-network type. */
     assert_parsed_header(header, AVS3_FALSE);

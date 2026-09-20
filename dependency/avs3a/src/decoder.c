@@ -194,6 +194,9 @@ int parse_header(AVS3DecoderHandle hAvs3Dec, unsigned char* pData, int nLenIn, i
         (codingProfile == 2 && hoaOrder > 3))
         return AVS3_FALSE;
 
+    if (codingProfile == 1 && soundBedType == 0)
+        return AVS3_UNSUPPORTED;
+
     // second part of CRC, 8 bits
     crcTmp += (uint16_t)GetNextIndice(headerBs, &nextBitPos, AVS3_BS_BYTE_SIZE);
 
