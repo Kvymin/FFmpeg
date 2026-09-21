@@ -52,7 +52,7 @@ static int check_playlist(const char *line, int position,
     if (parse_playlist(&hls, "http://test.invalid/index.m3u8", NULL, &io.pub) < 0)
         goto end;
     if (hls.n_playlists != 1 || !hls.playlists[0]->finished ||
-        hls.playlists[0]->n_segments != 3 ||
+        hls.playlists[0]->n_segments != 3 || format->duration != 12000000 ||
         !hls.playlists[0]->segments[1]->discontinuity ||
         !hls.playlists[0]->segments[2]->discontinuity ||
         hls.playlists[0]->allow_repeated_ad_blocks != allow_repeated ||
