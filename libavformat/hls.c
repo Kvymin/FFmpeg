@@ -259,6 +259,8 @@ typedef struct HLSContext {
     int http_persistent;
     int http_multiple;
     int http_seekable;
+    char *ca_file;
+    int tls_verify;
     int seg_max_retry;
     AVIOContext *playlist_pb;
     int hls_adblock;
@@ -1509,20 +1511,185 @@ typedef struct AdProbeCandidate {
     int end;
 } AdProbeCandidate;
 
+static int ad_probe_compare_candidates(const void *first, const void *second)
+{
+    const AdProbeCandidate *a = first, *b = second;
+    int a_length = a->end - a->first;
+    int b_length = b->end - b->first;
+
+    if (a_length != b_length)
+        return (a_length > b_length) - (a_length < b_length);
+    return (a->first > b->first) - (a->first < b->first);
+}
+
+#define AD_PROBE_PARALLELISM 4
+#define AD_PROBE_MAX_PROBES 96
+#define AD_PROBE_MAX_TOTAL_BYTES (96 * 1024 * 1024)
+
+enum AdProbeMeasurement {
+    AD_PROBE_UNMEASURED,
+    AD_PROBE_VALID,
+    /* Repeated candidates must not reopen a failed or unsupported segment. */
+    AD_PROBE_UNAVAILABLE,
+};
+
+typedef struct AdProbeTask {
+    HLSContext *c;
+    const struct segment *segment;
+    const AVIOInterruptCB *interrupt;
+    FFHLSAdProbeResult *result;
+    pthread_t thread;
+    int index;
+    int ret;
+    int threaded;
+} AdProbeTask;
+
+static void *ad_probe_run_task(void *opaque)
+{
+    AdProbeTask *task = opaque;
+
+    task->ret = ff_hls_ad_probe(task->segment->url, task->c->ad_probe_avio_opts,
+                                task->interrupt, task->c->ctx->protocol_whitelist,
+                                task->c->ctx->protocol_blacklist,
+                                av_gettime_relative() + 10 * AV_TIME_BASE,
+                                task->result);
+    return NULL;
+}
+
+static int ad_probe_measure_batch(HLSContext *c, const struct playlist *pls,
+                                   FFHLSAdProbeResult *results,
+                                   uint8_t *measurements,
+                                   const AVIOInterruptCB *interrupt,
+                                   const int *indices, int count,
+                                   int *probes, int64_t *bytes)
+{
+    int next = 0;
+    int valid = 1;
+
+    av_assert0(count > 0 && count <= AD_PROBE_PARALLELISM);
+    while (next < count) {
+        AdProbeTask tasks[AD_PROBE_PARALLELISM] = {0};
+        int scheduled = 0;
+
+        while (next < count) {
+            int index = indices[next];
+            const struct segment *seg = pls->segments[index];
+
+            if (measurements[index] != AD_PROBE_UNMEASURED) {
+                valid &= measurements[index] == AD_PROBE_VALID;
+                next++;
+                continue;
+            }
+            if (seg->key_type != KEY_NONE || seg->size >= 0 || seg->init_section ||
+                *probes + scheduled >= AD_PROBE_MAX_PROBES ||
+                *bytes >= AD_PROBE_MAX_TOTAL_BYTES) {
+                measurements[index] = AD_PROBE_UNAVAILABLE;
+                valid = 0;
+                next++;
+                continue;
+            }
+            if (scheduled > 0 && *bytes + (int64_t)(scheduled + 1) *
+                                  HLS_AD_PROBE_MAX_SEGMENT_BYTES >
+                                  AD_PROBE_MAX_TOTAL_BYTES)
+                break;
+            measurements[index] = AD_PROBE_UNAVAILABLE;
+            tasks[scheduled++] = (AdProbeTask) {
+                .c = c,
+                .segment = seg,
+                .interrupt = interrupt,
+                .result = &results[index],
+                .index = index,
+            };
+            next++;
+        }
+        *probes += scheduled;
+        for (int i = 0; i < scheduled; i++) {
+            if (scheduled > 1 && !pthread_create(&tasks[i].thread, NULL,
+                                                 ad_probe_run_task, &tasks[i]))
+                tasks[i].threaded = 1;
+            else
+                ad_probe_run_task(&tasks[i]);
+        }
+        for (int i = 0; i < scheduled; i++) {
+            if (tasks[i].threaded)
+                pthread_join(tasks[i].thread, NULL);
+            if (tasks[i].ret < 0) {
+                av_log(c->ctx, AV_LOG_DEBUG,
+                       "HLS ad probe segment %d failed: %s\n",
+                       tasks[i].index, av_err2str(tasks[i].ret));
+                valid = 0;
+            } else {
+                *bytes += tasks[i].result->size;
+                measurements[tasks[i].index] = AD_PROBE_VALID;
+            }
+        }
+    }
+    return valid;
+}
+
+static int ad_probe_measure(HLSContext *c, const struct playlist *pls,
+                            FFHLSAdProbeResult *results, uint8_t *measurements,
+                            const AVIOInterruptCB *interrupt, int index,
+                            int *probes, int64_t *bytes)
+{
+    return ad_probe_measure_batch(c, pls, results, measurements, interrupt,
+                                   &index, 1, probes, bytes);
+}
+
+static int ad_probe_same_durations(const struct playlist *pls,
+                                   AdProbeCandidate first,
+                                   AdProbeCandidate second)
+{
+    if (first.end - first.first != second.end - second.first)
+        return 0;
+    for (int i = 0; i < first.end - first.first; i++)
+        if (pls->segments[first.first + i]->duration !=
+            pls->segments[second.first + i]->duration)
+            return 0;
+    return 1;
+}
+
+static int ad_probe_separated(const uint8_t *covered, int count,
+                              int first, int end)
+{
+    for (int i = FFMAX(0, first - 1); i <= FFMIN(count - 1, end); i++)
+        if (covered[i])
+            return 0;
+    return 1;
+}
+
+static void ad_probe_publish(HLSContext *c, uint8_t *covered,
+                             int first, int end, int repeated)
+{
+    int published = 0;
+
+    ff_mutex_lock(&c->ad_probe_mutex);
+    if (!c->ad_probe_cancel && first >= c->ad_probe_frontier) {
+        memset(c->ad_probe_confirmed + first, 1, end - first);
+        published = 1;
+    }
+    ff_mutex_unlock(&c->ad_probe_mutex);
+    if (published) {
+        memset(covered + first, 1, end - first);
+        av_log(c->ctx, AV_LOG_DEBUG, "Confirmed %sHLS ad candidate [%d, %d)\n",
+               repeated ? "repeated " : "", first, end);
+    }
+}
+
 static void *ad_probe_worker(void *opaque)
 {
     HLSContext *c = opaque;
     const struct playlist *pls = c->playlists[0];
     FFHLSAdSegment *segments = av_calloc(pls->n_segments, sizeof(*segments));
     FFHLSAdProbeResult *results = av_calloc(pls->n_segments, sizeof(*results));
-    uint8_t *measured = av_calloc(pls->n_segments, sizeof(*measured));
+    uint8_t *measurements = av_calloc(pls->n_segments, sizeof(*measurements));
     uint8_t *covered = av_calloc(pls->n_segments, sizeof(*covered));
     AdProbeCandidate *candidates = av_calloc(pls->n_segments, sizeof(*candidates));
     AVIOInterruptCB interrupt = {ad_probe_interrupted, c};
     int probes = 0, count = 0, block_start = 0;
-    int64_t bytes = 0, elapsed = 0;
+    int64_t bytes = 0;
 
-    if (!segments || !results || !measured || !covered || !candidates)
+    if (!segments || !results || !measurements || !covered || !candidates)
         goto cleanup;
     for (int i = 0; i < pls->n_segments; i++)
         segments[i] = ad_segment(pls->segments[i]);
@@ -1534,87 +1701,129 @@ static void *ad_probe_worker(void *opaque)
             candidates[count++] = (AdProbeCandidate){block_start, end};
         block_start = end;
     }
-    /*
-     * Probe immediately in playback order. The global budgets below bound
-     * the work, and the frontier checks prevent late removals.
-     */
+    /* Short windows are checked first, as in Media3; the frontier rejects late removals. */
+    qsort(candidates, count, sizeof(*candidates), ad_probe_compare_candidates);
     for (int candidate = 0; candidate < count; candidate++) {
         int first = candidates[candidate].first;
         int end = candidates[candidate].end;
-        int failed = 0;
-        int canceled;
-        int64_t started, deadline;
+        int failed = 0, canceled, too_late;
 
-        if (covered[first])
+        if (!ad_probe_separated(covered, pls->n_segments, first, end))
             continue;
         ff_mutex_lock(&c->ad_probe_mutex);
         canceled = c->ad_probe_cancel;
-        failed = first < c->ad_probe_frontier;
+        too_late = first < c->ad_probe_frontier;
         ff_mutex_unlock(&c->ad_probe_mutex);
-        if (canceled || probes >= 96 || bytes >= 96 * 1024 * 1024 ||
-            elapsed >= 30 * AV_TIME_BASE)
+        if (canceled)
             break;
-        if (failed)
+        if (too_late)
             continue;
-        started = av_gettime_relative();
-        deadline = started + 10 * AV_TIME_BASE;
         for (int candidate_end = end, attempt = 0;
              candidate_end < pls->n_segments && candidate_end - first <= 30 &&
              attempt < 3; attempt++) {
-            for (int i = first - 1; i <= candidate_end; i++) {
-                const struct segment *seg = pls->segments[i];
-                int probe_ret;
+            int boundaries[] = {first - 1, first, candidate_end};
 
-                if (seg->key_type != KEY_NONE || seg->size >= 0 ||
-                    seg->init_section || probes >= 96 || bytes >= 96 * 1024 * 1024 ||
-                    av_gettime_relative() >= deadline) {
-                    failed = 1;
-                    break;
-                }
-                if (measured[i])
-                    continue;
-                probes++;
-                probe_ret = ff_hls_ad_probe(seg->url, c->ad_probe_avio_opts, &interrupt,
-                                            c->ctx->protocol_whitelist,
-                                            c->ctx->protocol_blacklist,
-                                            deadline, &results[i]);
-                if (probe_ret < 0) {
-                    av_log(c->ctx, AV_LOG_DEBUG, "HLS ad probe segment %d failed: %s\n",
-                           i, av_err2str(probe_ret));
-                    failed = 1;
-                    break;
-                }
-                bytes += results[i].size;
-                measured[i] = 1;
-            }
-            if (failed)
+            if (!ad_probe_separated(covered, pls->n_segments,
+                                    first, candidate_end))
                 break;
+            /* Measure entry and exit in parallel to avoid another network round trip. */
+            if (!ad_probe_measure_batch(c, pls, results, measurements,
+                                        &interrupt, boundaries, 3,
+                                        &probes, &bytes) ||
+                !ff_hls_ad_candidate_start(segments, results,
+                                           pls->n_segments, first)) {
+                failed = 1;
+                break;
+            }
+            if (ff_hls_ad_candidate_boundaries(segments, results,
+                                               pls->n_segments, first,
+                                               candidate_end)) {
+                for (int i = first + 1; i < candidate_end;) {
+                    int indices[AD_PROBE_PARALLELISM], n = 0;
+
+                    while (i < candidate_end && n < AD_PROBE_PARALLELISM)
+                        indices[n++] = i++;
+                    if (!ad_probe_measure_batch(c, pls, results, measurements,
+                                                &interrupt, indices, n,
+                                                &probes, &bytes)) {
+                        failed = 1;
+                        break;
+                    }
+                }
+                if (failed)
+                    break;
+            }
             if (ff_hls_ad_confirm_window(segments, results,
                                          pls->n_segments, first, candidate_end)) {
-                int published = 0;
-                ff_mutex_lock(&c->ad_probe_mutex);
-                if (!c->ad_probe_cancel && first >= c->ad_probe_frontier) {
-                    memset(c->ad_probe_confirmed + first, 1, candidate_end - first);
-                    published = 1;
-                }
-                ff_mutex_unlock(&c->ad_probe_mutex);
-                if (published) {
-                    memset(covered + first, 1, candidate_end - first);
-                    av_log(c->ctx, AV_LOG_DEBUG, "Confirmed HLS ad candidate [%d, %d)\n",
-                           first, candidate_end);
-                }
+                ad_probe_publish(c, covered, first, candidate_end, 0);
                 break;
             }
             while (++candidate_end < pls->n_segments &&
                    !segments[candidate_end].discontinuity) {}
         }
-        elapsed += av_gettime_relative() - started;
+        if (covered[first])
+            continue;
+        ff_mutex_lock(&c->ad_probe_mutex);
+        canceled = c->ad_probe_cancel;
+        too_late = first < c->ad_probe_frontier;
+        ff_mutex_unlock(&c->ad_probe_mutex);
+        if (canceled)
+            break;
+        if (too_late || end - first < 2 ||
+            measurements[first] != AD_PROBE_VALID ||
+            !ad_probe_separated(covered, pls->n_segments, first, end))
+            continue;
+        /* Try an exact replay now, while this candidate is still ahead of playback. */
+        for (int other = 0; other < count; other++) {
+            int other_first = candidates[other].first;
+            int other_end = candidates[other].end;
+            int matches = 1;
+
+            if (other == candidate ||
+                !ad_probe_same_durations(pls, candidates[candidate],
+                                          candidates[other]) ||
+                !ad_probe_measure(c, pls, results, measurements, &interrupt,
+                                  other_first, &probes, &bytes) ||
+                memcmp(results[first].content_fingerprint,
+                       results[other_first].content_fingerprint,
+                       sizeof(results[first].content_fingerprint)))
+                continue;
+            for (int i = 1; i < end - first;) {
+                int indices[AD_PROBE_PARALLELISM], start = i, n = 0;
+
+                while (i < end - first && n + 2 <= AD_PROBE_PARALLELISM) {
+                    indices[n++] = first + i;
+                    indices[n++] = other_first + i++;
+                }
+                if (!ad_probe_measure_batch(c, pls, results, measurements,
+                                            &interrupt, indices, n,
+                                            &probes, &bytes)) {
+                    matches = 0;
+                    break;
+                }
+                for (int offset = start; offset < i; offset++)
+                    if (memcmp(results[first + offset].content_fingerprint,
+                               results[other_first + offset].content_fingerprint,
+                               sizeof(results[first + offset].content_fingerprint))) {
+                        matches = 0;
+                        break;
+                    }
+                if (!matches)
+                    break;
+            }
+            if (!matches || !ff_hls_ad_same_content(segments, results,
+                                                    pls->n_segments, first,
+                                                    end, other_first, other_end))
+                continue;
+            ad_probe_publish(c, covered, first, end, 1);
+            break;
+        }
     }
 
 cleanup:
     av_free(candidates);
     av_free(covered);
-    av_free(measured);
+    av_free(measurements);
     av_free(results);
     av_free(segments);
     return NULL;
@@ -1637,6 +1846,12 @@ static void start_ad_probe(HLSContext *c)
     if (!c->ad_probe_confirmed)
         return;
     if (av_dict_copy(&c->ad_probe_avio_opts, c->avio_opts, 0) < 0)
+        goto fail;
+    if (c->ca_file &&
+        av_dict_set(&c->ad_probe_avio_opts, "ca_file", c->ca_file, 0) < 0)
+        goto fail;
+    if (av_dict_set_int(&c->ad_probe_avio_opts, "tls_verify",
+                        c->tls_verify, 0) < 0)
         goto fail;
     c->ad_probe_frontier = FFMAX(0, pls->cur_seq_no - pls->start_seq_no + 1);
     if (ff_mutex_init(&c->ad_probe_mutex, NULL))
@@ -3766,6 +3981,10 @@ static const AVOption hls_options[] = {
         OFFSET(http_multiple), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, FLAGS},
     {"http_seekable", "Use HTTP partial requests, 0 = disable, 1 = enable, -1 = auto",
         OFFSET(http_seekable), AV_OPT_TYPE_BOOL, { .i64 = -1}, -1, 1, FLAGS},
+    {"ca_file", "Certificate Authority database file for HLS ad probes",
+        OFFSET(ca_file), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS},
+    {"tls_verify", "Verify certificates for HLS ad probes",
+        OFFSET(tls_verify), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
     {"seg_format_options", "Set options for segment demuxer",
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
     {"seg_max_retry", "Maximum number of times to reload a segment on error.",

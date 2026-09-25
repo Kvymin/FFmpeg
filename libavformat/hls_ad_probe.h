@@ -20,6 +20,8 @@
 #include "avformat.h"
 #include "hls_ad_detect.h"
 
+#define HLS_AD_PROBE_MAX_SEGMENT_BYTES (8 * 1024 * 1024)
+
 int ff_hls_ad_probe(const char *url, const AVDictionary *avio_opts,
                     const AVIOInterruptCB *interrupt_callback,
                     const char *protocol_whitelist, const char *protocol_blacklist,

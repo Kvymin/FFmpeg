@@ -167,24 +167,38 @@ static enum Difference difference(const FFHLSAdSegment *a_segment,
     return DIFFERENCE_NONE;
 }
 
-int ff_hls_ad_confirm_window(const FFHLSAdSegment *segments,
+static int valid_measurement(const FFHLSAdSegment *segment,
+                             const FFHLSAdProbeResult *result)
+{
+    return segment->duration > 0 && result->size > 0 &&
+           result->width > 0 && result->height > 0 &&
+           result->frame_rate > 0 && result->frame_rate_margin >= 0;
+}
+
+int ff_hls_ad_candidate_start(const FFHLSAdSegment *segments,
                               const FFHLSAdProbeResult *results,
-                              int count, int first, int end)
+                              int count, int first)
+{
+    return segments && results && first >= 1 && first < count &&
+           valid_measurement(&segments[first - 1], &results[first - 1]) &&
+           valid_measurement(&segments[first], &results[first]) &&
+           difference(&segments[first - 1], &results[first - 1],
+                      &segments[first], &results[first]) != DIFFERENCE_NONE;
+}
+
+int ff_hls_ad_candidate_boundaries(const FFHLSAdSegment *segments,
+                                   const FFHLSAdProbeResult *results,
+                                   int count, int first, int end)
 {
     const FFHLSAdProbeResult *before, *inside, *after;
     enum Difference kind;
     double before_bitrate, after_bitrate;
 
-    if (!segments || !results || first < 1 || end <= first || end >= count ||
-        end - first > 30 || segments[end].url == NULL)
+    if (!ff_hls_ad_candidate_start(segments, results, count, first) ||
+        end <= first || end >= count || end - first > 30 ||
+        segments[end].url == NULL ||
+        !valid_measurement(&segments[end], &results[end]))
         return 0;
-    for (int i = first - 1; i <= end; i++) {
-        const FFHLSAdProbeResult *result = &results[i];
-        if (segments[i].duration <= 0 || result->size <= 0 ||
-            result->width <= 0 || result->height <= 0 ||
-            result->frame_rate <= 0 || result->frame_rate_margin < 0)
-            return 0;
-    }
     before = &results[first - 1];
     inside = &results[first];
     after = &results[end];
@@ -203,11 +217,53 @@ int ff_hls_ad_confirm_window(const FFHLSAdSegment *segments,
     }
     if (difference(&segments[end], after, &segments[first], inside) != kind)
         return 0;
+    return 1;
+}
+
+int ff_hls_ad_confirm_window(const FFHLSAdSegment *segments,
+                              const FFHLSAdProbeResult *results,
+                              int count, int first, int end)
+{
+    const FFHLSAdProbeResult *before, *inside, *after;
+    enum Difference kind;
+
+    if (!ff_hls_ad_candidate_boundaries(segments, results, count, first, end))
+        return 0;
+    before = &results[first - 1];
+    inside = &results[first];
+    after = &results[end];
+    kind = difference(&segments[first - 1], before, &segments[first], inside);
     for (int i = first; i < end; i++) {
+        if (!valid_measurement(&segments[i], &results[i]))
+            return 0;
         if (!same_resolution(inside, &results[i]) ||
             (kind != DIFFERENCE_RESOLUTION && !same_frame_rate(inside, &results[i])) ||
             difference(&segments[first - 1], before, &segments[i], &results[i]) != kind ||
             difference(&segments[end], after, &segments[i], &results[i]) != kind)
+            return 0;
+    }
+    return 1;
+}
+
+int ff_hls_ad_same_content(const FFHLSAdSegment *segments,
+                           const FFHLSAdProbeResult *results, int count,
+                           int first, int end, int other_first, int other_end)
+{
+    if (!segments || !results || first < 0 || other_first < 0 ||
+        end <= first || other_end <= other_first ||
+        end > count || other_end > count || end - first < 2 ||
+        end - first != other_end - other_first)
+        return 0;
+    for (int i = 0; i < end - first; i++) {
+        int a = first + i, b = other_first + i;
+        if (segments[a].duration != segments[b].duration ||
+            !valid_measurement(&segments[a], &results[a]) ||
+            !valid_measurement(&segments[b], &results[b]) ||
+            !results[a].has_content_fingerprint ||
+            !results[b].has_content_fingerprint ||
+            memcmp(results[a].content_fingerprint,
+                   results[b].content_fingerprint,
+                   sizeof(results[a].content_fingerprint)))
             return 0;
     }
     return 1;

@@ -38,6 +38,8 @@ typedef struct FFHLSAdProbeResult {
     double frame_rate_margin;
     int width;
     int height;
+    uint8_t content_fingerprint[32];
+    int has_content_fingerprint;
 } FFHLSAdProbeResult;
 
 /* Returns the number of removable segments, or zero for ambiguous playlists. */
@@ -45,9 +47,22 @@ int ff_hls_ad_detect(const FFHLSAdSegment *segments, int count,
                      int has_cue, int valid_cue, int allow_repeated_blocks,
                      uint8_t *remove);
 
+/* Rejects candidates before measuring their interior segments. */
+int ff_hls_ad_candidate_start(const FFHLSAdSegment *segments,
+                              const FFHLSAdProbeResult *results,
+                              int count, int first);
+int ff_hls_ad_candidate_boundaries(const FFHLSAdSegment *segments,
+                                   const FFHLSAdProbeResult *results,
+                                   int count, int first, int end);
+
 /* Confirms a discontinuity-bounded interior block from measured segment media. */
 int ff_hls_ad_confirm_window(const FFHLSAdSegment *segments,
                               const FFHLSAdProbeResult *results,
                               int count, int first, int end);
+
+/* Confirms two complete discontinuity blocks contain identical media. */
+int ff_hls_ad_same_content(const FFHLSAdSegment *segments,
+                           const FFHLSAdProbeResult *results, int count,
+                           int first, int end, int other_first, int other_end);
 
 #endif

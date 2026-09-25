@@ -72,6 +72,8 @@ int main(void)
         {.size = 400000, .frame_rate = 24, .width = 1280, .height = 720},
         {.size = 400000, .frame_rate = 24, .width = 1920, .height = 1080},
     };
+    FFHLSAdSegment replay_segments[7] = {0};
+    FFHLSAdProbeResult replay_results[7] = {0};
     FFHLSAdSegment single[] = {
         {.url = "card.ts", .duration = 1000000, .size = -1},
         {.url = "movie.ts", .duration = 4000000, .size = -1, .discontinuity = 1},
@@ -137,9 +139,22 @@ int main(void)
     if (check(repeat, 5, 0, 1, 1, 0, none5))
         return 1;
 
-    if (!ff_hls_ad_confirm_window(measured_segments, measured, 4, 1, 3) ||
+    if (!ff_hls_ad_candidate_start(measured_segments, measured, 4, 1) ||
+        !ff_hls_ad_candidate_boundaries(measured_segments, measured, 4, 1, 3) ||
+        !ff_hls_ad_confirm_window(measured_segments, measured, 4, 1, 3) ||
         ff_hls_ad_confirm_window(measured_segments, measured, 4, 0, 3))
         return 1;
+    measured[2].size = 0;
+    if (!ff_hls_ad_candidate_boundaries(measured_segments, measured, 4, 1, 3) ||
+        ff_hls_ad_confirm_window(measured_segments, measured, 4, 1, 3))
+        return 1;
+    measured[2].size = 400000;
+    measured[1] = measured[0];
+    if (ff_hls_ad_candidate_start(measured_segments, measured, 4, 1) ||
+        ff_hls_ad_candidate_boundaries(measured_segments, measured, 4, 1, 3))
+        return 1;
+    measured[1].width = measured[2].width = 1280;
+    measured[1].height = measured[2].height = 720;
     measured[2].width = 1920;
     if (ff_hls_ad_confirm_window(measured_segments, measured, 4, 1, 3))
         return 1;
@@ -154,6 +169,31 @@ int main(void)
         return 1;
     measured[3].size = 800000;
     if (ff_hls_ad_confirm_window(measured_segments, measured, 4, 1, 3))
+        return 1;
+    for (int i = 0; i < 7; i++) {
+        replay_segments[i].duration = 4000000;
+        replay_results[i] = (FFHLSAdProbeResult) {
+            .size = 4000, .frame_rate = 25, .width = 1280, .height = 720,
+            .has_content_fingerprint = 1,
+        };
+    }
+    replay_results[1].content_fingerprint[0] =
+        replay_results[4].content_fingerprint[0] = 1;
+    replay_results[2].content_fingerprint[0] =
+        replay_results[5].content_fingerprint[0] = 2;
+    if (!ff_hls_ad_same_content(replay_segments, replay_results, 7, 1, 3, 4, 6) ||
+        ff_hls_ad_same_content(replay_segments, replay_results, 7, 1, 2, 4, 5))
+        return 1;
+    replay_results[5].content_fingerprint[0] = 9;
+    if (ff_hls_ad_same_content(replay_segments, replay_results, 7, 1, 3, 4, 6))
+        return 1;
+    replay_results[5].content_fingerprint[0] = 2;
+    replay_results[5].has_content_fingerprint = 0;
+    if (ff_hls_ad_same_content(replay_segments, replay_results, 7, 1, 3, 4, 6))
+        return 1;
+    replay_results[5].has_content_fingerprint = 1;
+    replay_segments[5].duration++;
+    if (ff_hls_ad_same_content(replay_segments, replay_results, 7, 1, 3, 4, 6))
         return 1;
     return 0;
 }

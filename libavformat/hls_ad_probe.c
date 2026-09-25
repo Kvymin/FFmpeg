@@ -21,12 +21,12 @@
 #include "libavutil/avstring.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
+#include "libavutil/sha.h"
 #include "libavutil/time.h"
 #include "avformat.h"
 #include "avio_internal.h"
 #include "hls_ad_probe.h"
 
-#define MAX_SEGMENT_BYTES (8 * 1024 * 1024)
 #define MAX_SAMPLES 8192
 #define MIN_SAMPLES 6
 #define PTS_PRECISION_US (1000000.0 / 90000 + 2)
@@ -100,6 +100,7 @@ int ff_hls_ad_probe(const char *url, const AVDictionary *avio_opts,
     AVIOContext *network = NULL, *memory_io = NULL;
     AVDictionary *options = NULL;
     AVPacket *packet = NULL;
+    struct AVSHA *sha = NULL;
     int64_t *pts = NULL;
     uint8_t *data = NULL, *io_buffer = NULL;
     HLSAdMemory memory = {0};
@@ -116,7 +117,7 @@ int ff_hls_ad_probe(const char *url, const AVDictionary *avio_opts,
         return AVERROR_EXIT;
     packet = av_packet_alloc();
     pts = av_malloc_array(MAX_SAMPLES, sizeof(*pts));
-    data = av_malloc(MAX_SEGMENT_BYTES + 1);
+    data = av_malloc(HLS_AD_PROBE_MAX_SEGMENT_BYTES + 1);
     io_buffer = av_malloc(32768);
     if (!packet || !pts || !data || !io_buffer) {
         ret = AVERROR(ENOMEM);
@@ -128,9 +129,10 @@ int ff_hls_ad_probe(const char *url, const AVDictionary *avio_opts,
                               &options, protocol_whitelist, protocol_blacklist);
     if (ret < 0)
         goto cleanup;
-    while (size <= MAX_SEGMENT_BYTES) {
+    while (size <= HLS_AD_PROBE_MAX_SEGMENT_BYTES) {
         int read = avio_read(network, data + size,
-                             FFMIN(32768, MAX_SEGMENT_BYTES + 1 - size));
+                             FFMIN(32768,
+                                   HLS_AD_PROBE_MAX_SEGMENT_BYTES + 1 - size));
         if (read == AVERROR_EOF || read == 0)
             break;
         if (read < 0) {
@@ -143,7 +145,7 @@ int ff_hls_ad_probe(const char *url, const AVDictionary *avio_opts,
             goto cleanup;
         }
     }
-    if (size <= 0 || size > MAX_SEGMENT_BYTES) {
+    if (size <= 0 || size > HLS_AD_PROBE_MAX_SEGMENT_BYTES) {
         ret = AVERROR_INVALIDDATA;
         goto cleanup;
     }
@@ -229,9 +231,19 @@ int ff_hls_ad_probe(const char *url, const AVDictionary *avio_opts,
         .width = input->streams[video]->codecpar->width,
         .height = input->streams[video]->codecpar->height,
     };
+    sha = av_sha_alloc();
+    if (!sha) {
+        ret = AVERROR(ENOMEM);
+        goto cleanup;
+    }
+    av_sha_init(sha, 256);
+    av_sha_update(sha, data, size);
+    av_sha_final(sha, result->content_fingerprint);
+    result->has_content_fingerprint = 1;
     ret = 0;
 
 cleanup:
+    av_free(sha);
     av_dict_free(&options);
     avio_closep(&network);
     av_free(pts);
